@@ -196,6 +196,10 @@ handle_existing_installation() {
     rm -rf "$AG_INSTALL_DIR" "$AG_DATA_DIR" "$AG_LOG_DIR"
     userdel -r "$AG_USER" 2>/dev/null || true
     rm -f /etc/systemd/system/AdGuardHome.service
+    rm -f /etc/nginx/sites-enabled/adguardhome
+    rm -f /etc/nginx/sites-available/adguardhome
+    rm -f /etc/nginx/snippets/adguard-security-headers.conf
+    nginx -t && systemctl reload nginx 2>/dev/null || true
     systemctl daemon-reload
     print_info "Existing installation removed."
 }
@@ -293,8 +297,20 @@ step_check_tools() {
 }
 
 step_check_ubuntu() {
-    . /etc/os-release 2>/dev/null || true
-    [[ "$ID" != "ubuntu" ]] && print_warn "This script is tested on Ubuntu. Proceeding on $ID..."
+    local OS_ID OS_VERSION_ID
+    if [ -f /etc/os-release ]; then
+        OS_ID=$(grep -E '^ID=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "unknown")
+        OS_VERSION_ID=$(grep -E '^VERSION_ID=' /etc/os-release | cut -d= -f2 | tr -d '"' || echo "0")
+    else
+        OS_ID="unknown"
+        OS_VERSION_ID="0"
+    fi
+
+    if [[ "$OS_ID" != "ubuntu" ]]; then
+        print_warn "This script is tested on Ubuntu. Detected: ${OS_ID}. Proceeding anyway..."
+    else
+        print_info "Detected Ubuntu ${OS_VERSION_ID} — supported."
+    fi
 }
 
 step_update_system() {
@@ -314,9 +330,15 @@ step_disable_systemd_resolved() {
     # Port 53 may be occupied by systemd-resolved
     if ss -tuln | grep -q ":53\b"; then
         print_warn "Port 53 is in use. Disabling systemd-resolved stub listener..."
-        sed -i 's/#DNSStubListener=yes/DNSStubListener=no/' /etc/systemd/resolved.conf
+        local RESOLVED_CONF="/etc/systemd/resolved.conf"
+        # Remove any existing DNSStubListener line (commented or not), then append correct value
+        sed -i '/^#*DNSStubListener/d' "$RESOLVED_CONF" || true
+        echo "DNSStubListener=no" >> "$RESOLVED_CONF"
         systemctl restart systemd-resolved || true
+        sleep 1
         print_info "systemd-resolved stub listener disabled."
+    else
+        print_info "Port 53 is free — no action needed."
     fi
 }
 
@@ -351,12 +373,14 @@ step_download_adguard() {
     tar -xzf "$TMP_FILE" -C "$AG_INSTALL_DIR" --strip-components=2
     rm -f "$TMP_FILE"
     chmod +x "$AG_INSTALL_DIR/AdGuardHome"
+    chown -R "$AG_USER:$AG_USER" "$AG_INSTALL_DIR"
     print_info "AdGuard Home binary installed."
 }
 
 step_create_directories() {
-    mkdir -p "$AG_DATA_DIR" "$AG_LOG_DIR"
-    chown -R "$AG_USER:$AG_USER" "$AG_DATA_DIR" "$AG_LOG_DIR" "$AG_INSTALL_DIR"
+    mkdir -p "$AG_DATA_DIR" "$AG_LOG_DIR" "$AG_INSTALL_DIR"
+    chown -R "$AG_USER:$AG_USER" "$AG_DATA_DIR" "$AG_LOG_DIR"
+    print_info "Directories created."
 }
 
 step_write_config() {
@@ -510,34 +534,12 @@ step_configure_nginx() {
     # Disable default site
     rm -f /etc/nginx/sites-enabled/default
 
-    # Create AdGuard Nginx config
+    # Create AdGuard Nginx config — HTTP only first so Certbot can validate
+    # Certbot will modify this file to add SSL automatically
     cat > "/etc/nginx/sites-available/adguardhome" <<EOF
 server {
     listen 80;
     server_name ${NGINX_DOMAIN};
-
-    # Redirect HTTP → HTTPS
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-
-server {
-    listen 443 ssl http2;
-    server_name ${NGINX_DOMAIN};
-
-    # SSL placeholders — replaced by Certbot or manual certs
-    # ssl_certificate     /etc/letsencrypt/live/${NGINX_DOMAIN}/fullchain.pem;
-    # ssl_certificate_key /etc/letsencrypt/live/${NGINX_DOMAIN}/privkey.pem;
-
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers HIGH:!aNULL:!MD5;
-
-    # Security headers
-    add_header X-Frame-Options "SAMEORIGIN";
-    add_header X-Content-Type-Options "nosniff";
-    add_header X-XSS-Protection "1; mode=block";
-    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
     location / {
         proxy_pass         http://127.0.0.1:${AG_WEB_PORT};
@@ -552,19 +554,53 @@ server {
 EOF
 
     ln -sf /etc/nginx/sites-available/adguardhome /etc/nginx/sites-enabled/adguardhome
-    nginx -t && systemctl reload nginx
-    print_info "Nginx configured for $NGINX_DOMAIN."
+
+    # Test and reload Nginx with the clean HTTP config
+    nginx -t || print_error "Nginx config test failed. Check: nginx -t"
+    systemctl reload nginx
+    print_info "Nginx configured for $NGINX_DOMAIN (HTTP)."
 
     if [[ "$SSL_CHOICE" =~ ^(y|yes)$ ]]; then
         print_step "Obtaining Let's Encrypt certificate..."
-        certbot --nginx -d "$NGINX_DOMAIN" --non-interactive \
-            --agree-tos -m "$LETSENCRYPT_EMAIL" \
-            --redirect || print_warn "Certbot failed — verify DNS and try: certbot --nginx -d $NGINX_DOMAIN"
+        # --redirect tells Certbot to add the HTTPS redirect automatically
+        certbot --nginx \
+            -d "$NGINX_DOMAIN" \
+            --non-interactive \
+            --agree-tos \
+            -m "$LETSENCRYPT_EMAIL" \
+            --redirect \
+            --keep-until-expiring \
+            --allow-subset-of-names || {
+                print_warn "Certbot failed — make sure $NGINX_DOMAIN points to this server's IP."
+                print_warn "To retry manually: certbot --nginx -d $NGINX_DOMAIN -m $LETSENCRYPT_EMAIL --agree-tos --redirect"
+                return 0
+        }
+
+        # Add security headers after Certbot modifies the config
+        # Append them inside a new server block snippet
+        cat > "/etc/nginx/snippets/adguard-security-headers.conf" <<'HEADERS'
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header X-XSS-Protection "1; mode=block" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+HEADERS
+
+        # Include the snippet in the site config if not already there
+        if ! grep -q "adguard-security-headers" /etc/nginx/sites-available/adguardhome; then
+            sed -i '/server_name/a\    include snippets/adguard-security-headers.conf;' \
+                /etc/nginx/sites-available/adguardhome
+        fi
+
+        nginx -t && systemctl reload nginx || true
 
         # Enable auto-renewal
         systemctl enable --now certbot.timer 2>/dev/null || \
-            (crontab -l 2>/dev/null; echo "0 0 * * * certbot renew --quiet") | crontab -
+            { crontab -l 2>/dev/null; echo "0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'"; } | crontab -
+
+        AG_ACCESS_URL="https://${NGINX_DOMAIN}"
         print_info "SSL certificate obtained and auto-renewal enabled."
+    else
+        AG_ACCESS_URL="http://${NGINX_DOMAIN}"
     fi
 }
 
